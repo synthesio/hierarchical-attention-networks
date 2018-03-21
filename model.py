@@ -2,27 +2,35 @@
 
 
 from keras.models import Model
-from keras.layers import Input
+from keras.layers import Input, Dense, Concatenate, Multiply, multiply
 from keras.layers.embeddings import Embedding
 from keras.layers.recurrent import GRU
 from keras.layers.wrappers import Bidirectional, TimeDistributed
 from keras.layers.core import Dropout, Dense, Lambda, Masking
-from keras.engine.topology import merge, Layer
+from keras.engine.topology import Layer
 
-from keras import backend as K, initializations
+from keras import backend as K
+from keras import regularizers,initializers
 
 class AttentionLayer(Layer):
     '''
     Attention layer. 
     '''
-    def __init__(self, init='glorot_uniform', **kwargs):
+    def __init__(self, W_regularizer=None,b_regularizer=None,**kwargs):
+        self.supports_masking = False
+        # self.init = initializations.get(init)
+        self.W_regularizer =regularizers.get(W_regularizer)
+        self.b_regularizer =regularizers.get(b_regularizer)
         super(AttentionLayer, self).__init__(**kwargs)
-        self.supports_masking = True
-        self.init = initializations.get(init)
+        
         
     def build(self, input_shape):
         input_dim = input_shape[-1]
-        self.Uw = self.init((input_dim, ))
+        self.Uw = self.add_weight(name='Uw', 
+                                  shape=((input_dim, 1)),
+                                  initializer='glorot_uniform',
+                                  trainable=True)
+
         self.trainable_weights = [self.Uw]
         super(AttentionLayer, self).build(input_shape)  
     
@@ -30,11 +38,14 @@ class AttentionLayer(Layer):
         return mask
     
     def call(self, x, mask=None):
+        print(K.int_shape(x))   # (None, 80, 200)
+        print(K.int_shape(self.Uw)) # (200, 1)
         multData =  K.exp(K.dot(x, self.Uw))
         if mask is not None:
             multData = mask*multData
         output = multData/(K.sum(multData, axis=1)+K.epsilon())[:,None]
-        return K.reshape(output, (output.shape[0],output.shape[1],1))
+        print(K.int_shape(output))  #(None, 80, 1)
+        return output
 
     def get_output_shape_for(self, input_shape):
         newShape = list(input_shape)
@@ -73,30 +84,34 @@ def createHierarchicalAttentionModel(maxSeq,
     ## Sentence level logic 
     wordsInputs = Input(shape=(maxSeq,), dtype='int32', name='words_input')
     if embWeights is None:
-        emb = Embedding(vocabSize, embeddingSize, mask_zero=True)(wordsInputs)
+        # , mask_zero=True
+        emb = Embedding(vocabSize, embeddingSize)(wordsInputs)
     else:
-        emb = Embedding(embWeights.shape[0], embWeights.shape[1], mask_zero=True, weights=[embWeights], trainable=False)(wordsInputs)
+        emb = Embedding(embWeights.shape[0], embWeights.shape[1], weights=[embWeights], trainable=False)(wordsInputs)
     if dropWordEmb != 0.0:
         emb = Dropout(dropWordEmb)(emb)
     wordRnn = Bidirectional(recursiveClass(wordRnnSize, return_sequences=True), merge_mode='concat')(emb)
     if dropWordRnnOut  > 0.0:
         wordRnn = Dropout(dropWordRnnOut)(wordRnn)
     attention = AttentionLayer()(wordRnn)
-    sentenceEmb = merge([wordRnn, attention], mode=lambda x:x[1]*x[0], output_shape=lambda x:x[0])
+    sentenceEmb = Lambda(lambda x:x[1]*x[0], output_shape=lambda x:x[0])([wordRnn, attention])
+    # sentenceEmb = Concatenate([wordRnn, attention], mode=lambda x:x[1]*x[0], output_shape=lambda x:x[0])
     sentenceEmb = Lambda(lambda x:K.sum(x, axis=1), output_shape=lambda x:(x[0],x[2]))(sentenceEmb)
     modelSentence = Model(wordsInputs, sentenceEmb)
     modelSentAttention = Model(wordsInputs, attention)
     
     
     documentInputs = Input(shape=(None,maxSeq), dtype='int32', name='document_input')
-    sentenceMasking = Masking(mask_value=0)(documentInputs)
-    sentenceEmbbeding = TimeDistributed(modelSentence)(sentenceMasking)
-    sentenceAttention = TimeDistributed(modelSentAttention)(sentenceMasking)
+    # sentenceMasking = Masking(mask_value=0)(documentInputs)
+    sentenceEmbbeding = TimeDistributed(modelSentence)(documentInputs)
+    sentenceAttention = TimeDistributed(modelSentAttention)(documentInputs)
     sentenceRnn = Bidirectional(recursiveClass(wordRnnSize, return_sequences=True), merge_mode='concat')(sentenceEmbbeding)
     if dropSentenceRnnOut > 0.0:
         sentenceRnn = Dropout(dropSentenceRnnOut)(sentenceRnn)
     attentionSent = AttentionLayer()(sentenceRnn)
-    documentEmb = merge([sentenceRnn, attentionSent], mode=lambda x:x[1]*x[0], output_shape=lambda x:x[0])
+
+    documentEmb = multiply(inputs=[sentenceRnn, attentionSent])
+    # documentEmb = Merge([sentenceRnn, attentionSent], mode=lambda x:x[1]*x[0], output_shape=lambda x:x[0])
     documentEmb = Lambda(lambda x:K.sum(x, axis=1), output_shape=lambda x:(x[0],x[2]), name="att2")(documentEmb)
     documentOut = Dense(1, activation="sigmoid", name="documentOut")(documentEmb)
     
